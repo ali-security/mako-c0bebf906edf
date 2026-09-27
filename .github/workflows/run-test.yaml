@@ -1,20 +1,18 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector passed to tox as posargs"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       # run this job using this matrix
       matrix:
@@ -41,11 +39,30 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v2
 
+      # Seal: no arm64 CPython 3.7 exists, it cannot be built from source on current macOS
+      # (Homebrew dropped openssl@1.1), and the actions x64 build links Homebrew's x64
+      # libintl; the self-contained python.org x86_64 installer runs under Rosetta.
+      - name: Set up python 3.7 (macOS, python.org installer)
+        if: matrix.os == 'macos-latest' && matrix.python-version == '3.7'
+        run: |
+          curl -fsSLO https://www.python.org/ftp/python/3.7.9/python-3.7.9-macosx10.9.pkg
+          sudo installer -pkg python-3.7.9-macosx10.9.pkg -target /
+          bindir=/Library/Frameworks/Python.framework/Versions/3.7/bin
+          sudo ln -sf python3 "$bindir/python"
+          sudo ln -sf pip3 "$bindir/pip"
+          echo "$bindir" >> "$GITHUB_PATH"
+          "$bindir/python" -VV
+
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: ${{ !(matrix.os == 'macos-latest' && matrix.python-version == '3.7') }}
+        # actions/setup-python cannot provision CPython 3.7 on ubuntu-24.04 (ubuntu-latest) nor
+        # 3.7-3.10 on arm64 macos-latest; this drop-in builds from source where no prebuilt exists.
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
 
       - name: Install dependencies
         run: |
@@ -54,4 +71,27 @@ jobs:
           pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+      # Seal: build the sdist + wheel on a single leg. The build isolated env resolves
+      # setuptools/wheel through the PyPI time machine at the 1.2.4 release date so the
+      # wheel's Generator matches the published one (bdist_wheel 0.38.4).
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        env:
+          PIP_INDEX_URL: "https://:2022-11-15T14:37:53Z@time-machines-pypi.sealsecurity.io/"
+        # setup.cfg carries the dev-branch `tag_build = dev`; releases are cut with an
+        # empty tag (the public sdist's setup.cfg has `tag_build =`), so clear it first.
+        run: |
+          sed -i 's/^tag_build = dev$/tag_build =/' setup.cfg
+          python -m pip install build==0.9.0
+          python -m build
+          ls -l dist
+
+      - name: Upload dist
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
